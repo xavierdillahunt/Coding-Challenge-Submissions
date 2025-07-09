@@ -1,0 +1,136 @@
+import json
+import csv
+import base64
+import io
+import re
+import logging
+import boto3
+from datetime import datetime
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# S3 details
+S3_BUCKET = "scdhhs-mes-dev-operations"
+S3_KEY = "rules/rules.json"
+
+s3 = boto3.client('s3')
+
+def get_rules_from_s3():
+    logger.info(f"Fetching rules.json from s3://{S3_BUCKET}/{S3_KEY}")
+    response = s3.get_object(Bucket=S3_BUCKET, Key=S3_KEY)
+    content = response['Body'].read().decode('utf-8')
+    return json.loads(content)
+
+def lambda_handler(event, context):
+    try:
+        logger.info("Lambda triggered. Processing CSV with rules from S3.")
+
+        # Decode multipart body
+        body = base64.b64decode(event['body']) if event.get('isBase64Encoded', False) else event['body'].encode('utf-8')
+        content_type = event['headers'].get('content-type') or event['headers'].get('Content-Type')
+        boundary = content_type.split("boundary=")[-1]
+        parts = body.split(("--" + boundary).encode())
+
+        csv_data = None
+
+        for part in parts:
+            if b'name="file"' in part:
+                csv_data = part.split(b"\r\n\r\n", 1)[-1].rstrip(b"\r\n--")
+
+        if not csv_data:
+            logger.error("CSV file not provided.")
+            raise Exception("Missing CSV file")
+
+        rules = get_rules_from_s3()
+        filters = rules.get("filters", {})
+        sort_by = rules.get("sort_by")
+        logger.info(f"Rules loaded: {json.dumps(rules)}")
+
+        csv_reader = csv.DictReader(io.StringIO(csv_data.decode("utf-8")))
+        rows = list(csv_reader)
+        logger.info(f"CSV rows: {len(rows)}")
+
+        def cast_value(val):
+            try:
+                if isinstance(val, (list, dict)):
+                    val = str(val)
+                val = val.strip() if isinstance(val, str) else str(val)
+                try:
+                    return datetime.strptime(val, "%Y-%m-%d")
+                except:
+                    try:
+                        return float(val)
+                    except:
+                        return val
+            except Exception as e:
+                logger.warning(f"Failed to cast value '{val}': {e}")
+                return val
+
+        def match_criteria(value, condition):
+            if isinstance(condition, dict):
+                value_cast = cast_value(value)
+                for op, target in condition.items():
+                    target_cast = cast_value(target)
+                    if op == "eq" and value_cast != target_cast:
+                        return False
+                    elif op == "ne" and value_cast == target_cast:
+                        return False
+                    elif op == "in" and value_cast not in target:
+                        return False
+                    elif op == "not_in" and value_cast in target:
+                        return False
+                    elif op == "gte" and value_cast < target_cast:
+                        return False
+                    elif op == "lte" and value_cast > target_cast:
+                        return False
+                    elif op == "gt" and value_cast <= target_cast:
+                        return False
+                    elif op == "lt" and value_cast >= target_cast:
+                        return False
+                    elif op == "regex":
+                        if not re.match(target, str(value_cast)):
+                            return False
+                return True
+            else:
+                return str(value).strip() == str(condition).strip()
+
+        def row_matches(row):
+            for field, condition in filters.items():
+                try:
+                    raw = row.get(field)
+                    value = str(raw).strip() if raw is not None else ""
+                except Exception as e:
+                    logger.warning(f"Skipping field '{field}' due to error: {e}")
+                    return False
+
+                if not match_criteria(value, condition):
+                    return False
+            return True
+
+
+        filtered_rows = [row for row in rows if row_matches(row)]
+        logger.info(f"Rows matched: {len(filtered_rows)}")
+
+        if sort_by:
+            def get_sort_key(row):
+                try:
+                    return datetime.strptime(row.get(sort_by, ""), "%Y-%m-%d")
+                except:
+                    return row.get(sort_by, "")
+            filtered_rows = sorted(filtered_rows, key=get_sort_key)
+            logger.info(f"Rows sorted by {sort_by}.")
+
+        return {
+            "statusCode": 200,
+            "body": json.dumps(filtered_rows),
+            "headers": {"Content-Type": "application/json"}
+        }
+
+    except Exception as e:
+        logger.exception("Error during processing.")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": str(e)}),
+            "headers": {"Content-Type": "application/json"}
+        }
